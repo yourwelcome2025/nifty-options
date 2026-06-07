@@ -56,6 +56,19 @@ class MainActivity : Activity() {
 })();
 """
 
+    private val NUDGE_JS = """
+(function(){
+  try {
+    for (var i=0;i<6;i++){
+      document.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:40+i*25,clientY:60+i*18}));
+    }
+    window.scrollTo(0,250); window.scrollTo(0,0);
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  } catch(e) {}
+})();
+"""
+
     private lateinit var results: LinearLayout
     private lateinit var status: TextView
     private lateinit var button: Button
@@ -71,7 +84,8 @@ class MainActivity : Activity() {
     private var expiries: List<String> = emptyList()
     private var selectedExpiry: String? = null
     private var fetchTriggered = false
-    private var jsRetries = 0
+    private var attemptCount = 0
+    private var reloaded = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(s: Bundle?) {
@@ -151,8 +165,9 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (url != null && url.contains("option-chain") && !fetchTriggered) {
                     fetchTriggered = true
-                    status.text = "Loaded NSE — fetching option chain…"
-                    handler.postDelayed({ runFetchJs() }, 3500)
+                    status.text = if (reloaded) "Re-checking with NSE…" else "Letting NSE verify the browser…"
+                    nudge()
+                    handler.postDelayed({ runFetchJs() }, 7000)
                 }
             }
         }
@@ -166,7 +181,8 @@ class MainActivity : Activity() {
     private fun fetch() {
         button.isEnabled = false
         fetchTriggered = false
-        jsRetries = 0
+        attemptCount = 0
+        reloaded = false
         expiryScroll.visibility = View.GONE
         expiryLabel.visibility = View.GONE
         resultsScroll.visibility = View.GONE
@@ -193,17 +209,33 @@ class MainActivity : Activity() {
         button.isEnabled = true
     }
 
+    private fun nudge() {
+        webView.evaluateJavascript(NUDGE_JS, null)
+    }
+
     private fun handleResult(httpStatus: String, body: String) {
         if (body.contains("\"records\"") && body.contains("strikePrice")) {
             try { parseAndShow(body); return } catch (_: Exception) {}
         }
-        if (jsRetries < 2) {
-            jsRetries++
-            status.text = "Verifying browser… retry $jsRetries"
-            handler.postDelayed({ runFetchJs() }, 3500)
+        attemptCount++
+        if (attemptCount < 4) {
+            status.text = "NSE is verifying the browser… ($attemptCount)"
+            nudge()
+            handler.postDelayed({ runFetchJs() }, 4000)
             return
         }
-        // Diagnostic: show exactly what NSE returned
+        if (!reloaded) {
+            reloaded = true
+            fetchTriggered = false
+            attemptCount = 0
+            status.text = "Refreshing NSE's security check…"
+            handler.postDelayed({ webView.reload() }, 1000)
+            return
+        }
+        showDiagnostic(httpStatus, body)
+    }
+
+    private fun showDiagnostic(httpStatus: String, body: String) {
         webView.visibility = View.GONE
         resultsScroll.visibility = View.VISIBLE
         button.isEnabled = true
@@ -216,9 +248,9 @@ class MainActivity : Activity() {
         c.addView(text("/api/option-chain-indices?symbol=NIFTY", 11, Color.WHITE, top = 2))
         c.addView(text("Response (first 500 chars):", 12, Color.parseColor("#9FB3C8"), top = 8))
         c.addView(text(if (snippet.isBlank()) "(empty)" else snippet, 11, Color.WHITE, top = 2))
-        c.addView(text("Screenshot this whole box and send it — it shows exactly what to fix.", 11, Color.parseColor("#FBBF24"), top = 10))
+        c.addView(text("Still blocked by NSE's bot protection after extra time + a reload.", 11, Color.parseColor("#FBBF24"), top = 10))
         results.addView(c)
-        status.text = "Couldn't read data — see diagnostic below."
+        status.text = "Still blocked — see below."
     }
 
     override fun onDestroy() {
