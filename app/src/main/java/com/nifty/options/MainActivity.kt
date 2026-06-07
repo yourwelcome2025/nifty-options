@@ -1,25 +1,27 @@
 package com.nifty.options
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONObject
-import java.net.CookieHandler
-import java.net.CookieManager
-import java.net.CookiePolicy
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -32,41 +34,56 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * NIFTY Intraday Option Analyzer — single screen.
- * Tap REFRESH -> fetches the live NSE option chain, computes Black-Scholes
- * Greeks, and shows the most suitable CALL, PUT and a neutral BALANCED
- * (straddle) strike. Switch between expiries instantly (no re-fetch).
+ * NIFTY Intraday Option Analyzer.
+ * Uses an embedded WebView to load NSE's page (which passes their bot check),
+ * then fetches the option-chain JSON from inside that browser context and
+ * computes Black-Scholes Greeks + best CALL / PUT / BALANCED strikes.
  *
  * Educational tool only. Not investment advice. Verify on your broker.
  */
 class MainActivity : Activity() {
 
-    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    private val R_RATE = 0.065 // risk-free rate (annual)
+    private val R_RATE = 0.065
+    private val PAGE_URL = "https://www.nseindia.com/option-chain"
+    private val FETCH_JS = """
+(function(){
+  try {
+    fetch('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY',
+      {headers:{'Accept':'application/json, text/plain, */*'}, credentials:'include'})
+    .then(function(r){ return r.text(); })
+    .then(function(t){ AndroidBridge.onData(t); })
+    .catch(function(e){ AndroidBridge.onError(''+e); });
+  } catch(e) { AndroidBridge.onError(''+e); }
+})();
+"""
 
     private lateinit var results: LinearLayout
     private lateinit var status: TextView
     private lateinit var button: Button
-    private lateinit var spinner: ProgressBar
     private lateinit var expiryLabel: TextView
     private lateinit var expiryRow: LinearLayout
     private lateinit var expiryScroll: HorizontalScrollView
+    private lateinit var resultsScroll: ScrollView
+    private lateinit var webView: WebView
+    private val handler = Handler(Looper.getMainLooper())
     private var d = 1f
 
     private var lastJson: String? = null
     private var expiries: List<String> = emptyList()
     private var selectedExpiry: String? = null
+    private var fetchTriggered = false
+    private var jsRetries = 0
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         d = resources.displayMetrics.density
-        CookieHandler.setDefault(CookieManager(null, CookiePolicy.ACCEPT_ALL))
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0E1726"))
-            setPadding(dp(16), dp(16), dp(16), dp(24))
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
         }
 
         root.addView(text("NIFTY", 26, Color.WHITE, bold = true))
@@ -80,16 +97,13 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#2563EB"))
             setOnClickListener { fetch() }
         }
-        root.addView(button, lp(MATCH_PARENT, WRAP_CONTENT, top = 16))
-
-        spinner = ProgressBar(this).apply { visibility = View.GONE }
-        root.addView(spinner, lp(WRAP_CONTENT, WRAP_CONTENT, top = 12).also { it.gravity = Gravity.CENTER })
+        root.addView(button, lp(MATCH_PARENT, WRAP_CONTENT, top = 14))
 
         status = text("Tap REFRESH to load the latest option chain.", 13, Color.parseColor("#9FB3C8"))
         root.addView(status, lp(MATCH_PARENT, WRAP_CONTENT, top = 10))
 
         expiryLabel = text("", 12, Color.parseColor("#9FB3C8"), bold = true).apply { visibility = View.GONE }
-        root.addView(expiryLabel, lp(MATCH_PARENT, WRAP_CONTENT, top = 14))
+        root.addView(expiryLabel, lp(MATCH_PARENT, WRAP_CONTENT, top = 12))
 
         expiryRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         expiryScroll = HorizontalScrollView(this).apply {
@@ -99,106 +113,114 @@ class MainActivity : Activity() {
         }
         root.addView(expiryScroll, lp(MATCH_PARENT, WRAP_CONTENT, top = 6))
 
+        val contentFrame = FrameLayout(this)
         results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(results, lp(MATCH_PARENT, WRAP_CONTENT, top = 6))
+        resultsScroll = ScrollView(this).apply {
+            visibility = View.GONE
+            addView(results)
+        }
+        webView = WebView(this).apply { visibility = View.GONE }
+        setupWebView()
+        contentFrame.addView(resultsScroll, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        contentFrame.addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        val cf = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f).apply { topMargin = dp(8) }
+        root.addView(contentFrame, cf)
 
         root.addView(
             text(
-                "Ranks how TRADEABLE each strike is (liquidity + responsiveness + " +
-                        "time-decay efficiency). It does not predict direction — a CALL suits a " +
-                        "bullish view, a PUT a bearish one, BALANCED a neutral straddle. " +
-                        "Educational only; not investment advice.",
-                11, Color.parseColor("#6B7C93")
-            ), lp(MATCH_PARENT, WRAP_CONTENT, top = 20)
+                "Ranks how TRADEABLE each strike is (liquidity + responsiveness + time-decay " +
+                        "efficiency). Not a direction call — CALL = bullish, PUT = bearish, " +
+                        "BALANCED = neutral. Educational only; not investment advice.",
+                10, Color.parseColor("#6B7C93")
+            ), lp(MATCH_PARENT, WRAP_CONTENT, top = 8)
         )
 
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#0E1726"))
-            addView(root)
-        }
-        setContentView(scroll)
+        setContentView(root)
     }
 
-    // ---------------- networking ----------------
+    // ---------------- WebView-based fetch ----------------
+
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    private fun setupWebView() {
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.databaseEnabled = true
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.addJavascriptInterface(Bridge(), "AndroidBridge")
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                if (url != null && url.contains("option-chain") && !fetchTriggered) {
+                    fetchTriggered = true
+                    status.text = "Loaded NSE — fetching option chain…"
+                    handler.postDelayed({ runFetchJs() }, 3500)
+                }
+            }
+        }
+    }
+
+    inner class Bridge {
+        @JavascriptInterface
+        fun onData(json: String) { runOnUiThread { handleJson(json) } }
+
+        @JavascriptInterface
+        fun onError(msg: String) { runOnUiThread { retryOrFail() } }
+    }
 
     private fun fetch() {
         button.isEnabled = false
-        spinner.visibility = View.VISIBLE
-        status.text = "Fetching NIFTY option chain from NSE…"
+        fetchTriggered = false
+        jsRetries = 0
+        expiryScroll.visibility = View.GONE
+        expiryLabel.visibility = View.GONE
+        resultsScroll.visibility = View.GONE
         results.removeAllViews()
-        Thread {
-            try {
-                val body = httpGetNSE()
-                val exps = parseExpiries(body)
-                runOnUiThread {
-                    spinner.visibility = View.GONE
-                    button.isEnabled = true
-                    lastJson = body
-                    expiries = exps
-                    if (selectedExpiry == null || selectedExpiry !in expiries)
-                        selectedExpiry = expiries.firstOrNull()
-                    buildExpiryChips()
-                    analyzeAndRender()
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    spinner.visibility = View.GONE
-                    button.isEnabled = true
-                    status.text = "Could not fetch (${e.message}).\n\nNSE often rate-limits — wait a few " +
-                            "seconds and tap REFRESH again. Use normal mobile data / Wi-Fi (some VPNs are blocked)."
-                }
-            }
-        }.start()
+        webView.visibility = View.VISIBLE
+        status.text = "Opening NSE in a secure browser…"
+        webView.loadUrl(PAGE_URL)
     }
 
-    private fun conn(url: String): HttpURLConnection =
-        (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 15000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", UA)
-            setRequestProperty("Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-            setRequestProperty("Accept-Language", "en-US,en;q=0.9,en-IN;q=0.8,en-GB;q=0.7")
-            setRequestProperty("Cache-Control", "max-age=0")
-            setRequestProperty("sec-ch-ua",
-                "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"")
-            setRequestProperty("sec-ch-ua-mobile", "?0")
-            setRequestProperty("sec-ch-ua-platform", "\"Windows\"")
-            setRequestProperty("Sec-Fetch-Dest", "document")
-            setRequestProperty("Sec-Fetch-Mode", "navigate")
-            setRequestProperty("Sec-Fetch-Site", "none")
-            setRequestProperty("Sec-Fetch-User", "?1")
-            setRequestProperty("Upgrade-Insecure-Requests", "1")
-        }
+    private fun runFetchJs() {
+        status.text = "Fetching option chain… (please wait)"
+        webView.evaluateJavascript(FETCH_JS, null)
+    }
 
-    private fun prime(url: String) {
+    private fun handleJson(json: String) {
+        val looksValid = json.contains("\"records\"") && json.contains("strikePrice")
+        if (!looksValid) { retryOrFail(); return }
         try {
-            val c = conn(url)
-            c.responseCode
-            c.inputStream.use { it.readBytes() }
-        } catch (_: Exception) {
+            val exps = parseExpiries(json)
+            if (exps.isEmpty()) { retryOrFail(); return }
+            lastJson = json
+            expiries = exps
+            if (selectedExpiry == null || selectedExpiry !in expiries) selectedExpiry = expiries.firstOrNull()
+            webView.visibility = View.GONE
+            resultsScroll.visibility = View.VISIBLE
+            buildExpiryChips()
+            analyzeAndRender()
+            button.isEnabled = true
+        } catch (e: Exception) {
+            retryOrFail()
         }
     }
 
-    private fun httpGetNSE(): String {
-        prime("https://www.nseindia.com")
-        prime("https://www.nseindia.com/option-chain")
-        try { Thread.sleep(700) } catch (_: Exception) {}
-        var last = "no response"
-        val api = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-        for (attempt in 0 until 3) {
-            val c = conn(api)
-            val code = c.responseCode
-            val stream = if (code in 200..299) c.inputStream else c.errorStream
-            val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            if (code in 200..299 && body.contains("records")) return body
-            last = "HTTP $code"
-            Thread.sleep(1200)
-            prime("https://www.nseindia.com")
+    private fun retryOrFail() {
+        if (jsRetries < 4) {
+            jsRetries++
+            status.text = "NSE is verifying the browser… retry $jsRetries"
+            handler.postDelayed({ runFetchJs() }, 3500)
+        } else {
+            webView.visibility = View.GONE
+            resultsScroll.visibility = View.VISIBLE
+            button.isEnabled = true
+            status.text = "Couldn't get data from NSE this time. Wait ~30s and tap REFRESH again " +
+                    "(best on mobile data, no VPN, during market hours)."
         }
-        throw RuntimeException(last)
+    }
+
+    override fun onDestroy() {
+        try { webView.destroy() } catch (_: Exception) {}
+        super.onDestroy()
     }
 
     private fun parseExpiries(json: String): List<String> {
@@ -207,8 +229,6 @@ class MainActivity : Activity() {
         for (i in 0 until arr.length()) out.add(arr.getString(i))
         return out
     }
-
-    // ---------------- expiry selector ----------------
 
     private fun buildExpiryChips() {
         expiryRow.removeAllViews()
@@ -223,11 +243,7 @@ class MainActivity : Activity() {
         val show = expiries.take(6)
         for ((idx, e) in show.withIndex()) {
             val selected = (e == selectedExpiry)
-            val tag = when (idx) {
-                0 -> "\n(nearest)"
-                1 -> "\n(next)"
-                else -> ""
-            }
+            val tag = when (idx) { 0 -> "\n(nearest)"; 1 -> "\n(next)"; else -> "" }
             val chip = Button(this).apply {
                 text = e + tag
                 isAllCaps = false
@@ -256,7 +272,7 @@ class MainActivity : Activity() {
             status.text = "Updated:  spot ${fmt(res.spot, 2)}   •   expiry ${res.expiry}"
             render(res)
         } catch (e: Exception) {
-            status.text = "Could not analyze (${e.message}). Try REFRESH again."
+            status.text = "Could not analyze (${e.message})."
         }
     }
 
@@ -291,7 +307,6 @@ class MainActivity : Activity() {
         val spot = rec.optDouble("underlyingValue", 0.0)
         val data = rec.getJSONArray("data")
 
-        // time to expiry (expiry day 15:30 IST), clamped to >= 1 minute
         val sdf = SimpleDateFormat("dd-MMM-yyyy", Locale.ENGLISH)
         val ist = TimeZone.getTimeZone("Asia/Kolkata")
         sdf.timeZone = ist
@@ -367,7 +382,6 @@ class MainActivity : Activity() {
         val callPicks = ceList.sortedByDescending { it.score }
         val putPicks = peList.sortedByDescending { it.score }
 
-        // BALANCED = strike where BOTH legs are most tradeable (neutral / straddle)
         var balanced: Balanced? = null
         var bestComb = -1.0
         for ((k, c) in ceByK) {
@@ -413,6 +427,7 @@ class MainActivity : Activity() {
             results.addView(text("Other puts", 12, Color.parseColor("#9FB3C8"), bold = true, top = 12))
             for (p in r.topPuts.drop(1)) results.addView(miniRow(p))
         }
+        results.addView(text(" ", 10, Color.parseColor("#0E1726"), top = 16))
     }
 
     private fun pickCard(p: Pick?, bg: String, accent: String): View {
