@@ -41,8 +41,8 @@ import kotlin.math.sqrt
  */
 class MainActivity : Activity() {
 
-    private val UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     private val R_RATE = 0.065 // risk-free rate (annual)
 
     private lateinit var results: LinearLayout
@@ -154,13 +154,23 @@ class MainActivity : Activity() {
     private fun conn(url: String): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 12000
-            readTimeout = 12000
+            connectTimeout = 15000
+            readTimeout = 15000
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", UA)
-            setRequestProperty("Accept", "application/json, text/plain, */*")
-            setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-            setRequestProperty("Referer", "https://www.nseindia.com/option-chain")
+            setRequestProperty("Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+            setRequestProperty("Accept-Language", "en-US,en;q=0.9,en-IN;q=0.8,en-GB;q=0.7")
+            setRequestProperty("Cache-Control", "max-age=0")
+            setRequestProperty("sec-ch-ua",
+                "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"")
+            setRequestProperty("sec-ch-ua-mobile", "?0")
+            setRequestProperty("sec-ch-ua-platform", "\"Windows\"")
+            setRequestProperty("Sec-Fetch-Dest", "document")
+            setRequestProperty("Sec-Fetch-Mode", "navigate")
+            setRequestProperty("Sec-Fetch-Site", "none")
+            setRequestProperty("Sec-Fetch-User", "?1")
+            setRequestProperty("Upgrade-Insecure-Requests", "1")
         }
 
     private fun prime(url: String) {
@@ -175,6 +185,7 @@ class MainActivity : Activity() {
     private fun httpGetNSE(): String {
         prime("https://www.nseindia.com")
         prime("https://www.nseindia.com/option-chain")
+        try { Thread.sleep(700) } catch (_: Exception) {}
         var last = "no response"
         val api = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
         for (attempt in 0 until 3) {
