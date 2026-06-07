@@ -50,10 +50,9 @@ class MainActivity : Activity() {
   try {
     fetch('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY',
       {headers:{'Accept':'application/json, text/plain, */*'}, credentials:'include'})
-    .then(function(r){ return r.text(); })
-    .then(function(t){ AndroidBridge.onData(t); })
-    .catch(function(e){ AndroidBridge.onError(''+e); });
-  } catch(e) { AndroidBridge.onError(''+e); }
+    .then(function(r){ var st=''+r.status; return r.text().then(function(t){ AndroidBridge.onResult(st, t); }); })
+    .catch(function(e){ AndroidBridge.onResult('ERR', ''+e); });
+  } catch(e) { AndroidBridge.onResult('ERR', ''+e); }
 })();
 """
 
@@ -161,10 +160,7 @@ class MainActivity : Activity() {
 
     inner class Bridge {
         @JavascriptInterface
-        fun onData(json: String) { runOnUiThread { handleJson(json) } }
-
-        @JavascriptInterface
-        fun onError(msg: String) { runOnUiThread { retryOrFail() } }
+        fun onResult(httpStatus: String, body: String) { runOnUiThread { handleResult(httpStatus, body) } }
     }
 
     private fun fetch() {
@@ -185,37 +181,44 @@ class MainActivity : Activity() {
         webView.evaluateJavascript(FETCH_JS, null)
     }
 
-    private fun handleJson(json: String) {
-        val looksValid = json.contains("\"records\"") && json.contains("strikePrice")
-        if (!looksValid) { retryOrFail(); return }
-        try {
-            val exps = parseExpiries(json)
-            if (exps.isEmpty()) { retryOrFail(); return }
-            lastJson = json
-            expiries = exps
-            if (selectedExpiry == null || selectedExpiry !in expiries) selectedExpiry = expiries.firstOrNull()
-            webView.visibility = View.GONE
-            resultsScroll.visibility = View.VISIBLE
-            buildExpiryChips()
-            analyzeAndRender()
-            button.isEnabled = true
-        } catch (e: Exception) {
-            retryOrFail()
-        }
+    private fun parseAndShow(json: String) {
+        val exps = parseExpiries(json)
+        lastJson = json
+        expiries = exps
+        if (selectedExpiry == null || selectedExpiry !in expiries) selectedExpiry = expiries.firstOrNull()
+        webView.visibility = View.GONE
+        resultsScroll.visibility = View.VISIBLE
+        buildExpiryChips()
+        analyzeAndRender()
+        button.isEnabled = true
     }
 
-    private fun retryOrFail() {
-        if (jsRetries < 4) {
-            jsRetries++
-            status.text = "NSE is verifying the browser… retry $jsRetries"
-            handler.postDelayed({ runFetchJs() }, 3500)
-        } else {
-            webView.visibility = View.GONE
-            resultsScroll.visibility = View.VISIBLE
-            button.isEnabled = true
-            status.text = "Couldn't get data from NSE this time. Wait ~30s and tap REFRESH again " +
-                    "(best on mobile data, no VPN, during market hours)."
+    private fun handleResult(httpStatus: String, body: String) {
+        if (body.contains("\"records\"") && body.contains("strikePrice")) {
+            try { parseAndShow(body); return } catch (_: Exception) {}
         }
+        if (jsRetries < 2) {
+            jsRetries++
+            status.text = "Verifying browser… retry $jsRetries"
+            handler.postDelayed({ runFetchJs() }, 3500)
+            return
+        }
+        // Diagnostic: show exactly what NSE returned
+        webView.visibility = View.GONE
+        resultsScroll.visibility = View.VISIBLE
+        button.isEnabled = true
+        results.removeAllViews()
+        val snippet = if (body.length > 500) body.substring(0, 500) else body
+        val c = card("#2A1518")
+        c.addView(text("FETCH DIAGNOSTIC", 14, Color.parseColor("#F87171"), bold = true))
+        c.addView(kv("HTTP status", httpStatus))
+        c.addView(text("Address tried:", 12, Color.parseColor("#9FB3C8"), top = 8))
+        c.addView(text("/api/option-chain-indices?symbol=NIFTY", 11, Color.WHITE, top = 2))
+        c.addView(text("Response (first 500 chars):", 12, Color.parseColor("#9FB3C8"), top = 8))
+        c.addView(text(if (snippet.isBlank()) "(empty)" else snippet, 11, Color.WHITE, top = 2))
+        c.addView(text("Screenshot this whole box and send it — it shows exactly what to fix.", 11, Color.parseColor("#FBBF24"), top = 10))
+        results.addView(c)
+        status.text = "Couldn't read data — see diagnostic below."
     }
 
     override fun onDestroy() {
